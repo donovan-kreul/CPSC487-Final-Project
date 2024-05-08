@@ -93,6 +93,22 @@
         return result;
     }
 
+    function compute_point_in_line(p0, p1) {
+        return compute_weighted_sum(3, 2, [p0, p1], [2, -1]);
+    }
+
+    function align_derivative_control_points(P) {
+        let l = P.length;
+        P[1] = compute_point_in_line(P[0], P[l - 1]);
+        for (let i = 1; i <= (l / 3) - 1; i++) {
+            P[3*i + 1] = compute_point_in_line(P[3*i], P[3*i - 1]);
+        }
+
+        for (let i = 0; i < l / 3.0; i++) {
+            tge.set_position_of_gizmo(3*i + 1, P[3*i + 1]);
+        }
+    }
+
     function spline_segment_create_cubic_bezier(P) {
         let result = {
             B: [[1, 0, 0, 0], [-3, 3, 0, 0], [3, -6, 3, 0], [-1, 3, -3, 1]],
@@ -163,7 +179,10 @@
     }
 
     function spline_draw(spline, res=0.01) {
+        // get updated points
         update_points_from_gizmos(P, G);
+
+        // draw main track
         for (let i = 0; i < spline.length - 1; i++) {
             let tmp_list = [P[3*i], P[3*i + 1], P[3*i + 2], P[3*i + 3]];
             spline_segment_compute_A(spline[i], tmp_list);
@@ -173,12 +192,25 @@
         let tmp_list = [P[l - 3], P[l - 2], P[l - 1], P[0]];
         spline_segment_compute_A(spline[spline.length - 1], tmp_list);
         spline_segment_draw_curve(spline[spline.length - 1], res);
+
+        // draw dashed lines to derivative control points
+        if (settings.deriv_lines_visible === true) {
+            for (let i = 1; i < P.length / 3; i++) {
+                engine.draw_debug_line(P[3*i], P[3*i - 1], false, 0.005, 0x444444, 0.3);
+            }
+            engine.draw_debug_line(P[0], P[P.length - 1], false, 0.005, 0x444444, 0.3);
+        }
+    }
+
+    function spline_evaluate_point(spline, t) {
+        // let t_arc = compute_t_arc();
+        let t_floor = Math.trunc(t);
+        let t_dec = t - t_floor;
+        return spline_segment_evaluate_point(spline[t_floor % spline.length], t_dec);
     }
 
     function spline_draw_coaster(spline, t) {
-        let t_floor = Math.trunc(t);
-        let t_dec = t - t_floor;
-        let p = spline_segment_evaluate_point(spline[t_floor % spline.length], t_dec);
+        let p = spline_evaluate_point(spline, t);
         engine.draw_debug_sphere(p, 0.05, 0xff8800);
     }
 
@@ -195,45 +227,114 @@
         engine.draw_debug_line(start_pt, add_matrix_matrix(start_pt, basis_z), true, 0.003, 0x0000ff, 1.0);
     }
 
+    function hide_deriv_gizmos(P) {
+        for (let i = 0; i < P.length; i++) {
+            if (i % 3 === 1) {
+                tge.set_visibility_of_gizmo(engine, i, false);
+                tge.gizmo_wireframe_objects[i].visible = false;
+                tge.gizmo_mesh_objects[i].visible = false;
+            }
+        }
+    }
+
+    function compute_euclid_distance(p0, p1) {
+        return Math.sqrt((p0[0] - p1[0])**2 + (p0[1] - p1[1])**2 + (p0[2] - p1[2])**2);
+    }
+
+    function compute_arclength_distance_array(spline) {
+        let t_samples = settings.t_samples;
+        dists = [0];
+        for (let i = 1; i < n; i++) {
+            let p0 = spline_evaluate_point(spline, t_samples[i]);
+            let p1 = spline_evaluate_point(spline, t_samples[i + 1]);
+            dists.push(compute_euclid_distance(p0, p1) + dists[i - 1]);
+        }
+        return dists;
+    }
+
+    function compute_t_arc() {
+        let dists = settings.dists;
+        let t_samples = settings.t_samples;
+        let d = dists[dists.length - 1];
+        let d_target = d * settings.t / t_max;
+        let idx;
+        for (let i = 0; i < d.length - 1; i++) {
+            if (dists[i] <= d_target && d_target < dists[i+1]) {
+                idx = i;
+                break;
+            }
+        }
+        let d_l = dists[idx];
+        let d_u = dists[idx + 1];
+        let r = (d_target - d_l) / (d_u - d_l);
+        return (1 - r) * t_samples[idx] + r * t_samples[idx + 1];
+    }
+
     let engine = ThreeEngine.new_default_3d();
     let gui = get_default_lil_gui();
 
     let settings = {
         t: 0,
         speed: 0.5,
+        gizmos_visible: false,
+        deriv_lines_visible: true,
+        t_samples: [],
+        dists: [],
     }
 
-    // let actions = {
-    //     evaluate_t: function() {
-    //         let p = evaluate_B_spline(spline, settings.t);
-    //         console.log(p);
-    //         engine.draw_debug_sphere(p, 0.05, 0x0000ff);
-    //         refresh_displays(gui);
-    //     }
-    // }
 
-    // let P = [[0, -1, 0], [2, 0, 0], [0, 1, 0], [-2, 0, 0], [1, 0, 0], [0, 3, 0]];
+    // set up list of points
     let P = [[-1, 0, 0], [-1/2, 1/2, 0], [0, 1, 0], [1/2, 1/2, 0], [1, 0, 0], [1/2, -1/2, 0], [0, -1, 0], [-1/3, -2/3, 0], [-2/3, -1/3, 0]];
 
+
+    // set up gizmos
     let tge = new TransformGizmoEngine(engine);
     let G = [];
     let gizmo_scale = 0.4;
     for (let i = 0; i < P.length; i++) {
         G.push(tge.add_gizmo_SO3_matrix_and_position(engine, identity_matrix(3), P[i], gizmo_scale));
+        hide_deriv_gizmos(P);
     }
 
     // create the spline = a list of spline segments
     let spline = spline_create_cubic_bezier(P);
 
-    gui.add(settings, "t", 0, spline.length).name("t: ");
+
+    // arc-length parameterization
+    let n = 20;
+    let t_max = spline.length;
+    let t_samples = [];
+    let dists = [];
+    for (let i = 0; i <= n; i++) {
+        t_samples.push(i * t_max / n);
+    }
+    // dists = compute_arclength_distance_array(spline);
+
+
+    // set up gui
+    gui.add(settings, "t", 0, t_max).name("t: ");
     gui.add(settings, "speed", 0, 4).name("speed:");
+    gui.add(settings, "gizmos_visible").name("gizmos visible?");
+    gui.add(settings, "deriv_lines_visible").name("derivative lines vis?");
+
 
     engine.animation_loop(()  => {
+        // settings.dists = compute_arclength_distance_array(spline);
+
+        // toggle gizmo viz
+        tge.set_visibility_of_all_gizmos(engine, settings.gizmos_visible);
+        hide_deriv_gizmos(P);
+
+        // align ctrl pts between adjacent curves
+        align_derivative_control_points(P, spline);
+
+        // increment t based on speed
         settings.t = (settings.speed * engine.get_delta_time_from_last_frame() + settings.t) % 3;
+
+        // draw spline and coaster car
         spline_draw(spline);
-        spline_draw_coaster(spline, settings.t);
-        // let t_point = spline_segment_evaluate_point(spline[0], settings.t);
-        // engine.draw_debug_sphere(t_point, 0.1, 0xff8800);
+        spline_draw_coaster(spline, settings.t, t_samples, dists);
+
         refresh_displays(gui);
     });
 
