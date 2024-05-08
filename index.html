@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>CPSC 487/587</title>
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/10.3.0/math.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/quaternion@1.5.1/quaternion.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/numeric@1.2.6/numeric-1.2.6.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stats.js@0.17.0/build/stats.min.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+              "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+              "three/": "https://unpkg.com/three@0.160.0/"
+            }
+        }
+    </script>
+</head>
+<body>
+<script type="module">
+    import {get_default_lil_gui, ThreeEngine, refresh_displays} from "./js/utils/utils_three.js";
+    import {identity_matrix, mul_matrix_matrix, add_matrix_matrix, dot_product, transpose} from "./js/utils/utils_math.js";
+    import {TransformGizmoEngine} from "./js/utils/utils_transform_gizmo.js";
+
+    function exp_coords_to_so3(u, theta) {
+        let v = [u[0] * theta, u[1] * theta, u[2] * theta];
+        return [[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]];
+    }
+
+    function multiply_matrix_scalar(M, c) {
+        return M.map(row => row.map(elem => c * elem));
+    }
+
+    // convert exponential coords (u, theta) to SO3 matrix
+    function exponential_coords_so3_to_SO3(u, theta) {
+        let m = exp_coords_to_so3(u, theta);
+        let m_sq = mul_matrix_matrix(m, m);
+        let result = identity_matrix(3);
+        let p = 0, q = 0;
+        if (Math.abs(theta) < 0.001) {
+            p = 1 - theta**2 / 6.0 + theta**4 / 120.0;
+            q = 1/2.0 - theta**2 / 24.0 + theta**4 / 720.0;
+        }
+        else {
+            p = Math.sin(theta) / theta;
+            q = (1 - Math.cos(theta)) / theta**2;
+        }
+        let pm = multiply_matrix_scalar(m, p);
+        let qm_sq = multiply_matrix_scalar(m_sq, q);
+        result = add_matrix_matrix(result, pm);
+        return add_matrix_matrix(result, qm_sq);
+    }
+
+    function SO3_and_position_to_SE3(M, t) {
+        let result = identity_matrix(4);
+        for (let i = 0; i < 3; i++) {
+            for (let j = 0; j < 3; j++) {
+                result[i][j] = M[i][j];
+            }
+        }
+        for (let i = 0; i < 3; i++) {
+            result[i][3] = t[i];
+        }
+        return result;
+    }
+
+    // n rows, m columns
+    function matrix_create_NxM_all_zeroes(n, m) {
+        let result = [];
+        for (let i = 0; i < n; i++) {
+            let row = [];
+            for (let j = 0; j < m; j++) {
+                row.push(0.0);
+            }
+            result.push(row);
+        }
+        return result;
+    }
+
+    // P is list of n many pt_dim-dimensional points, W is list of n many weights
+    // return the pt_dim-vector whose coordinates are the weighed sums
+    function compute_weighted_sum(pt_dim, n, P, W) {
+        let result = [];
+        for (let i = 0; i < pt_dim; i++) {
+            let weighted_sum = 0;
+            for (let j = 0; j < n; j++) {
+                weighted_sum += W[j] * P[j][i];
+            }
+            result.push(weighted_sum);
+        }
+        return result;
+    }
+
+    function spline_segment_create_cubic_bezier(P) {
+        let result = {
+            B: [[1, 0, 0, 0], [-3, 3, 0, 0], [3, -6, 3, 0], [-1, 3, -3, 1]],
+            Px: [],
+            Py: [],
+            Pz: [],
+            Ax: [],
+            Ay: [],
+            Az: [],
+        }
+        result = spline_segment_compute_A(result, P);
+        return result;
+    }
+
+    function spline_segment_compute_A(seg, P) {
+        let Px = P.map(point => point[0]);
+        let Py = P.map(point => point[1]);
+        let Pz = P.map(point => point[2]);
+
+        let Ax = transpose(mul_matrix_matrix(seg.B, transpose([Px])))[0];
+        let Ay = transpose(mul_matrix_matrix(seg.B, transpose([Py])))[0];
+        let Az = transpose(mul_matrix_matrix(seg.B, transpose([Pz])))[0];
+
+        seg.Px = Px;
+        seg.Py = Py;
+        seg.Pz = Pz;
+        seg.Ax = Ax;
+        seg.Ay = Ay;
+        seg.Az = Az;
+
+        return seg;
+    }
+
+    function update_points_from_gizmos(P, G) {
+        for (let i = 0; i < P.length; i++) {
+            let new_pose = tge.get_gizmo_pose_as_SO3_matrix_and_position(G[i]);
+            P[i] = new_pose[1];
+        }
+    }
+
+    function spline_segment_evaluate_point(seg, t) {
+        let T = [1, t, t**2, t**3];
+        return [dot_product(seg.Ax, T), dot_product(seg.Ay, T), dot_product(seg.Az, T)];
+    }
+
+    function spline_segment_draw_curve(seg, res) {
+        let p1, p2;
+        for (let t = 0; t <= 1; t += res) {
+            p1 = spline_segment_evaluate_point(seg, t);
+            p2 = spline_segment_evaluate_point(seg, t+res);
+            engine.draw_debug_line(p1, p2, false, 0.02, 0x000000, 1.0);
+        }
+    }
+
+    function spline_create_cubic_bezier(P) {
+        let l = P.length;
+        let result = [];
+        result.push(spline_segment_create_cubic_bezier([P[0], P[1], P[2], P[3]]));
+
+        for (let i = 3; i < l - 3; i+=3) {
+            result.push(spline_segment_create_cubic_bezier([P[i], P[i+1], P[i+2], P[i+3]]));
+        }
+
+        // final connection back to start
+        result.push(spline_segment_create_cubic_bezier([P[l - 3], P[l - 2], P[l - 1], P[0]]));
+
+        return result;
+    }
+
+    function spline_draw(spline, res=0.01) {
+        update_points_from_gizmos(P, G);
+        for (let i = 0; i < spline.length - 1; i++) {
+            let tmp_list = [P[3*i], P[3*i + 1], P[3*i + 2], P[3*i + 3]];
+            spline_segment_compute_A(spline[i], tmp_list);
+            spline_segment_draw_curve(spline[i], res);
+        }
+        let l = P.length;
+        let tmp_list = [P[l - 3], P[l - 2], P[l - 1], P[0]];
+        spline_segment_compute_A(spline[spline.length - 1], tmp_list);
+        spline_segment_draw_curve(spline[spline.length - 1], res);
+    }
+
+    function spline_draw_coaster(spline, t) {
+        let t_floor = Math.trunc(t);
+        let t_dec = t - t_floor;
+        let p = spline_segment_evaluate_point(spline[t_floor % spline.length], t_dec);
+        engine.draw_debug_sphere(p, 0.05, 0xff8800);
+    }
+
+    function draw_coordinate_frame_from_SE3(engine, M) {
+        let scale = 0.05;
+        let basis_x = [scale*M[0][0], scale*M[1][0], scale*M[2][0]];
+        let basis_y = [scale*M[0][1], scale*M[1][1], scale*M[2][1]];
+        let basis_z = [scale*M[0][2], scale*M[1][2], scale*M[2][2]];
+
+        let start_pt = [M[0][3], M[1][3], M[2][3]];
+
+        engine.draw_debug_line(start_pt, add_matrix_matrix(start_pt, basis_x), true, 0.003, 0xff0000, 1.0);
+        engine.draw_debug_line(start_pt, add_matrix_matrix(start_pt, basis_y), true, 0.003, 0x00ff00, 1.0);
+        engine.draw_debug_line(start_pt, add_matrix_matrix(start_pt, basis_z), true, 0.003, 0x0000ff, 1.0);
+    }
+
+    let engine = ThreeEngine.new_default_3d();
+    let gui = get_default_lil_gui();
+
+    let settings = {
+        t: 0,
+        speed: 0.5,
+    }
+
+    // let actions = {
+    //     evaluate_t: function() {
+    //         let p = evaluate_B_spline(spline, settings.t);
+    //         console.log(p);
+    //         engine.draw_debug_sphere(p, 0.05, 0x0000ff);
+    //         refresh_displays(gui);
+    //     }
+    // }
+
+    // let P = [[0, -1, 0], [2, 0, 0], [0, 1, 0], [-2, 0, 0], [1, 0, 0], [0, 3, 0]];
+    let P = [[-1, 0, 0], [-1/2, 1/2, 0], [0, 1, 0], [1/2, 1/2, 0], [1, 0, 0], [1/2, -1/2, 0], [0, -1, 0], [-1/3, -2/3, 0], [-2/3, -1/3, 0]];
+
+    let tge = new TransformGizmoEngine(engine);
+    let G = [];
+    let gizmo_scale = 0.4;
+    for (let i = 0; i < P.length; i++) {
+        G.push(tge.add_gizmo_SO3_matrix_and_position(engine, identity_matrix(3), P[i], gizmo_scale));
+    }
+
+    // create the spline = a list of spline segments
+    let spline = spline_create_cubic_bezier(P);
+
+    gui.add(settings, "t", 0, spline.length).name("t: ");
+    gui.add(settings, "speed", 0, 4).name("speed:");
+
+    engine.animation_loop(()  => {
+        settings.t = (settings.speed * engine.get_delta_time_from_last_frame() + settings.t) % 3;
+        spline_draw(spline);
+        spline_draw_coaster(spline, settings.t);
+        // let t_point = spline_segment_evaluate_point(spline[0], settings.t);
+        // engine.draw_debug_sphere(t_point, 0.1, 0xff8800);
+        refresh_displays(gui);
+    });
+
+</script>
+</body>
+</html>
+
+
